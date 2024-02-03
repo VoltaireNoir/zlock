@@ -1,0 +1,9 @@
+[package]
+name = "zlock"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.153"
+pwhash = "1.0.0"
+xcb = "1.3.0"
