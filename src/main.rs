@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use xcb::x::EventMask;
 use xcb::{x, Connection};
+use xkbcommon::xkb;
 
 const TIMEOUT: u64 = 3;
 
@@ -156,13 +157,41 @@ impl Lock {
             std::thread::sleep(Duration::from_secs(TIMEOUT));
             tx.send(true).unwrap();
         });
+        let keyb = Keyb::new().expect("failed to acquire keyboard state");
         while rx.try_recv().is_err() {
             if let Some(xcb::Event::X(x::Event::KeyPress(key_press))) =
                 self.conn.poll_for_event()?
             {
-                print!("{}", key_press.detail());
+                let code = key_press.detail();
+                if keyb.is_enter(code) {
+                    break;
+                }
+                println!("{:?}", keyb.keycode_to_char(code));
             };
         }
         Ok(())
+    }
+}
+
+struct Keyb(xkb::State);
+
+impl Keyb {
+    fn new() -> Option<Self> {
+        let context = xkb::Context::new(0);
+        xkb::Keymap::new_from_names(&context, "", "", "", "", None, 0)
+            .map(|kmap| Keyb(xkb::State::new(&kmap)))
+    }
+
+    fn keycode_to_keysym(&self, code: x::Keycode) -> xkb::Keysym {
+        self.0.key_get_one_sym(xkb::Keycode::new(code as u32))
+    }
+
+    fn keycode_to_char(&self, code: x::Keycode) -> Option<char> {
+        char::from_u32(self.keycode_to_keysym(code).raw())
+    }
+
+    fn is_enter(&self, code: x::Keycode) -> bool {
+        let sym = self.keycode_to_keysym(code);
+        xkb::Keysym::Return == sym
     }
 }
