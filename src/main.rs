@@ -1,12 +1,10 @@
 use std::error::Error;
 use std::ffi::{CStr, CString};
+use std::str::Utf8Error;
 use std::sync::OnceLock;
-use std::time::Duration;
 use xcb::x::EventMask;
 use xcb::{x, Connection};
 use xkbcommon::xkb;
-
-const TIMEOUT: u64 = 3;
 
 // TODO: Add simple tty lock as well
 
@@ -15,9 +13,18 @@ fn main() {
     lock.handle_events().unwrap();
 }
 
-fn pass_check(pass: &str) -> bool {
+#[derive(Debug, Clone, Copy)]
+enum Auth {
+    Correct,
+    Incorrect,
+}
+
+fn pass_check(pass: &str) -> Auth {
     let hash = get_hash();
-    pwhash::unix::verify(pass.trim(), hash)
+    if pwhash::unix::verify(pass.trim(), hash) {
+        return Auth::Correct;
+    }
+    Auth::Incorrect
 }
 
 fn get_hash() -> &'static str {
@@ -36,6 +43,7 @@ fn get_hash() -> &'static str {
     })
 }
 
+// TODO: Implement graceful shutdown/unlock (use Drop trait to: destroy win and cursor, ungrab keyboard and mouse)
 struct Lock {
     cursor: x::Cursor,
     lock: x::Window,
@@ -152,24 +160,73 @@ impl Lock {
     }
 
     fn handle_events(&self) -> Result<(), Box<dyn Error>> {
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(TIMEOUT));
-            tx.send(true).unwrap();
-        });
         let keyb = Keyb::new().expect("failed to acquire keyboard state");
-        while rx.try_recv().is_err() {
-            if let Some(xcb::Event::X(x::Event::KeyPress(key_press))) =
-                self.conn.poll_for_event()?
-            {
-                let code = key_press.detail();
-                if keyb.is_enter(code) {
+        let mut acc = Accumulator::new();
+        loop {
+            acc.get_input(&self.conn, &keyb);
+            let pass = acc.build_str().unwrap();
+            if !pass.is_empty() {
+                if matches!(pass_check(pass), Auth::Correct) {
                     break;
                 }
-                println!("{:?}", keyb.keycode_to_char(code));
-            };
+                acc.clear();
+                continue;
+            } else {
+                // escape hatch if pass fails (for dev only)
+                break;
+            }
         }
         Ok(())
+    }
+}
+
+struct Accumulator {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl Accumulator {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(10),
+            len: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.len = 0;
+    }
+
+    fn push_char(&mut self, c: char) {
+        if self.len > 255 {
+            self.clear();
+        }
+        self.buf.push(c as _);
+        self.len += 1;
+    }
+
+    fn build_str(&self) -> Result<&str, Utf8Error> {
+        std::str::from_utf8(&self.buf[..self.len])
+    }
+
+    fn get_input(&mut self, conn: &Connection, keyb: &Keyb) {
+        loop {
+            let xcb::Event::X(x::Event::KeyPress(key_press)) =
+                conn.wait_for_event().expect("failed to poll for event")
+            else {
+                continue;
+            };
+            let code = key_press.detail();
+            if keyb.is_enter(code) {
+                break;
+            }
+            let Some(ch) = keyb.keycode_to_char(code) else {
+                self.clear();
+                break;
+            };
+            self.push_char(ch);
+        }
     }
 }
 
