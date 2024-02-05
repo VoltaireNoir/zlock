@@ -26,7 +26,7 @@ enum Auth {
 
 fn pass_check(pass: &str) -> Auth {
     let hash = get_hash();
-    if pwhash::unix::verify(pass.trim(), hash) {
+    if pwhash::unix::verify(pass, hash) {
         return Auth::Correct;
     }
     Auth::Incorrect
