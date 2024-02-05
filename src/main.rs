@@ -1,9 +1,13 @@
-use std::error::Error;
-use std::ffi::{CStr, CString};
-use std::str::Utf8Error;
-use std::sync::OnceLock;
-use xcb::x::EventMask;
-use xcb::{x, Connection};
+use std::{
+    error::Error,
+    ffi::{CStr, CString},
+    str::Utf8Error,
+    sync::OnceLock,
+};
+use xcb::{
+    x::{self, EventMask},
+    Connection,
+};
 use xkbcommon::xkb;
 
 const MAX_BUF_SIZE: usize = 500;
@@ -13,8 +17,9 @@ const MIN_BUF_CAP: usize = 15;
 // TODO: Add simple tty lock as well
 
 fn main() {
-    let lock = Lock::lock_screen().expect("failed to lock the screen");
-    lock.authenticate()
+    Lock::lock_screen()
+        .expect("failed to lock the screen")
+        .authenticate()
         .expect("failure occured while trying to authenticate password");
 }
 
