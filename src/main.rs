@@ -6,11 +6,16 @@ use xcb::x::EventMask;
 use xcb::{x, Connection};
 use xkbcommon::xkb;
 
+const MAX_BUF_SIZE: usize = 500;
+const MIN_BUF_CAP: usize = 15;
+
+// TODO: Add proper error handling
 // TODO: Add simple tty lock as well
 
 fn main() {
-    let lock = Lock::lock_screen().unwrap();
-    lock.handle_events().unwrap();
+    let lock = Lock::lock_screen().expect("failed to lock the screen");
+    lock.authenticate()
+        .expect("failure occured while trying to authenticate password");
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +49,7 @@ fn get_hash() -> &'static str {
 }
 
 // TODO: Implement graceful shutdown/unlock (use Drop trait to: destroy win and cursor, ungrab keyboard and mouse)
+// TODO: Handle multiple screens
 struct Lock {
     cursor: x::Cursor,
     lock: x::Window,
@@ -159,37 +165,37 @@ impl Lock {
         Ok(lock)
     }
 
-    fn handle_events(&self) -> Result<(), Box<dyn Error>> {
-        let keyb = Keyb::new().expect("failed to acquire keyboard state");
-        let mut acc = Accumulator::new();
+    fn authenticate(&self) -> Result<(), Box<dyn Error>> {
+        let mut handler = InputHandler::new();
         loop {
-            acc.get_input(&self.conn, &keyb);
-            let pass = acc.build_str().unwrap();
+            handler.get_input(&self.conn);
+            let Ok(pass) = handler.build_str() else {
+                handler.clear();
+                continue;
+            };
             if !pass.is_empty() {
                 if matches!(pass_check(pass), Auth::Correct) {
                     break;
                 }
-                acc.clear();
-                continue;
-            } else {
-                // escape hatch if pass fails (for dev only)
-                break;
+                handler.clear();
             }
         }
         Ok(())
     }
 }
 
-struct Accumulator {
+struct InputHandler {
     buf: Vec<u8>,
     len: usize,
+    keyb: Keyb,
 }
 
-impl Accumulator {
+impl InputHandler {
     fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(10),
+            buf: Vec::with_capacity(MIN_BUF_CAP),
             len: 0,
+            keyb: Keyb::new().expect("failed to acquire keyboard state"),
         }
     }
 
@@ -199,18 +205,23 @@ impl Accumulator {
     }
 
     fn push_char(&mut self, c: char) {
-        if self.len > 255 {
+        if self.len == MAX_BUF_SIZE {
             self.clear();
         }
         self.buf.push(c as _);
         self.len += 1;
     }
 
+    fn pop_char(&mut self) {
+        self.buf.pop();
+        self.len = self.len.saturating_sub(1);
+    }
+
     fn build_str(&self) -> Result<&str, Utf8Error> {
         std::str::from_utf8(&self.buf[..self.len])
     }
 
-    fn get_input(&mut self, conn: &Connection, keyb: &Keyb) {
+    fn get_input(&mut self, conn: &Connection) {
         loop {
             let xcb::Event::X(x::Event::KeyPress(key_press)) =
                 conn.wait_for_event().expect("failed to poll for event")
@@ -218,14 +229,27 @@ impl Accumulator {
                 continue;
             };
             let code = key_press.detail();
-            if keyb.is_enter(code) {
-                break;
+            match self.keyb.keycode_to_keysym(code) {
+                xkb::Keysym::Return => {
+                    break;
+                }
+                xkb::Keysym::Escape => {
+                    self.clear();
+                }
+                xkb::Keysym::BackSpace => {
+                    self.pop_char();
+                }
+                other => {
+                    let Some(ch) = Keyb::keysym_to_char(other) else {
+                        // password will be invalid anyway if it's not a valid char
+                        // clearing it will fail auth correctly
+                        self.clear();
+                        break;
+                    };
+
+                    self.push_char(ch);
+                }
             }
-            let Some(ch) = keyb.keycode_to_char(code) else {
-                self.clear();
-                break;
-            };
-            self.push_char(ch);
         }
     }
 }
@@ -243,12 +267,7 @@ impl Keyb {
         self.0.key_get_one_sym(xkb::Keycode::new(code as u32))
     }
 
-    fn keycode_to_char(&self, code: x::Keycode) -> Option<char> {
-        char::from_u32(self.keycode_to_keysym(code).raw())
-    }
-
-    fn is_enter(&self, code: x::Keycode) -> bool {
-        let sym = self.keycode_to_keysym(code);
-        xkb::Keysym::Return == sym
+    fn keysym_to_char(key: xkb::Keysym) -> Option<char> {
+        char::from_u32(key.raw())
     }
 }
