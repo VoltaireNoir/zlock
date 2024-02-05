@@ -3,6 +3,7 @@ use std::{
     ffi::{CStr, CString},
     str::Utf8Error,
     sync::OnceLock,
+    time::Duration,
 };
 use xcb::{
     x::{self, EventMask},
@@ -186,6 +187,23 @@ impl Lock {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        self.conn.send_request(&x::FreeCursor {
+            cursor: self.cursor,
+        });
+        self.conn.send_request(&x::UngrabKeyboard {
+            time: x::CURRENT_TIME,
+        });
+        self.conn.send_request(&x::UngrabPointer {
+            time: x::CURRENT_TIME,
+        });
+        self.conn
+            .send_request(&x::DestroyWindow { window: self.lock });
+        let _ = self.conn.flush();
     }
 }
 
