@@ -1,60 +1,25 @@
-use std::{
-    error::Error,
-    ffi::{CStr, CString},
-    str::Utf8Error,
-    sync::OnceLock,
-    time::Duration,
-};
+use std::error::Error;
 use xcb::{
     x::{self, EventMask},
     Connection,
 };
-use xkbcommon::xkb;
+use xkbcommon::xkb::{self, x11, KeyDirection};
 
-const MAX_BUF_SIZE: usize = 500;
+const MAX_BUF_SIZE: usize = 15;
 const MIN_BUF_CAP: usize = 15;
 
 // TODO: Add proper error handling
 // TODO: Add simple tty lock as well
 
 fn main() {
+    println!("Locking screen");
     Lock::lock_screen()
         .expect("failed to lock the screen")
         .authenticate()
         .expect("failure occured while trying to authenticate password");
+    println!("Unlocking screen");
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Auth {
-    Correct,
-    Incorrect,
-}
-
-fn pass_check(pass: &str) -> Auth {
-    let hash = get_hash();
-    if pwhash::unix::verify(pass, hash) {
-        return Auth::Correct;
-    }
-    Auth::Incorrect
-}
-
-fn get_hash() -> &'static str {
-    // TODO: Add support for retrieving hash from passwd file if present
-    static HASH: OnceLock<String> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| {
-        let name = CString::new(std::env::var("USER").unwrap()).unwrap();
-        let info = unsafe { libc::getspnam(name.as_ptr()) };
-        if info.is_null() {
-            panic!("Failed to acquire password hash. Make sure the executible is running as root");
-        }
-        let pass = unsafe { CStr::from_ptr((*info).sp_pwdp) };
-        pass.to_str()
-            .expect("Failed to acquire password hash: cannot convert to String")
-            .to_owned()
-    })
-}
-
-// TODO: Implement graceful shutdown/unlock (use Drop trait to: destroy win and cursor, ungrab keyboard and mouse)
 // TODO: Handle multiple screens
 struct Lock {
     cursor: x::Cursor,
@@ -98,7 +63,11 @@ impl Lock {
             value_list: &[
                 x::Cw::BackPixel(screen.black_pixel()),
                 x::Cw::OverrideRedirect(true),
-                x::Cw::EventMask(x::EventMask::KEY_PRESS),
+                x::Cw::EventMask(
+                    x::EventMask::KEY_PRESS
+                        | x::EventMask::KEYMAP_STATE
+                        | x::EventMask::KEY_RELEASE,
+                ),
             ],
         })?;
         self.conn
@@ -172,21 +141,20 @@ impl Lock {
     }
 
     fn authenticate(&self) -> Result<(), Box<dyn Error>> {
-        let mut handler = InputHandler::new();
+        let mut pam_client = pam::Client::with_password("system-auth")?;
+        let user = std::env::var("USER").unwrap();
+        let mut handler = InputHandler::new(&self.conn);
         loop {
             handler.get_input(&self.conn);
-            let Ok(pass) = handler.build_str() else {
-                handler.clear();
-                continue;
-            };
+            let pass = handler.get_str();
             if !pass.is_empty() {
-                if matches!(pass_check(pass), Auth::Correct) {
-                    break;
+                pam_client.conversation_mut().set_credentials(&user, pass);
+                if pam_client.authenticate().is_ok() {
+                    return Ok(());
                 }
                 handler.clear();
             }
         }
-        Ok(())
     }
 }
 
@@ -208,51 +176,53 @@ impl Drop for Lock {
 }
 
 struct InputHandler {
-    buf: Vec<u8>,
-    len: usize,
+    buf: String,
     keyb: Keyb,
 }
 
 impl InputHandler {
-    fn new() -> Self {
+    fn new(conn: &Connection) -> Self {
         Self {
-            buf: Vec::with_capacity(MIN_BUF_CAP),
-            len: 0,
-            keyb: Keyb::new().expect("failed to acquire keyboard state"),
+            buf: String::with_capacity(MIN_BUF_CAP),
+            keyb: Keyb::new(conn),
         }
     }
 
     fn clear(&mut self) {
         self.buf.clear();
-        self.len = 0;
     }
 
     fn push_char(&mut self, c: char) {
-        if self.len == MAX_BUF_SIZE {
+        if self.buf.len() == MAX_BUF_SIZE {
+            println!("Reached max input buffer size");
             self.clear();
         }
-        self.buf.push(c as _);
-        self.len += 1;
+        self.buf.push(c);
     }
 
     fn pop_char(&mut self) {
         self.buf.pop();
-        self.len = self.len.saturating_sub(1);
     }
 
-    fn build_str(&self) -> Result<&str, Utf8Error> {
-        std::str::from_utf8(&self.buf[..self.len])
+    fn get_str(&self) -> &str {
+        &self.buf
     }
 
     fn get_input(&mut self, conn: &Connection) {
         loop {
-            let xcb::Event::X(x::Event::KeyPress(key_press)) =
-                conn.wait_for_event().expect("failed to poll for event")
-            else {
-                continue;
+            let event = match conn.wait_for_event() {
+                Ok(xcb::Event::X(x::Event::KeyPress(event))) => {
+                    self.keyb.update(event.detail(), KeyDirection::Down);
+                    event
+                }
+                Ok(xcb::Event::X(x::Event::KeyRelease(event))) => {
+                    self.keyb.update(event.detail(), KeyDirection::Up);
+                    continue;
+                }
+                _ => continue,
             };
-            let code = key_press.detail();
-            match self.keyb.keycode_to_keysym(code) {
+
+            match self.keyb.keycode_to_keysym(event.detail()) {
                 xkb::Keysym::Return => {
                     break;
                 }
@@ -262,8 +232,9 @@ impl InputHandler {
                 xkb::Keysym::BackSpace => {
                     self.pop_char();
                 }
+                other if other.is_modifier_key() => (),
                 other => {
-                    let Some(ch) = Keyb::keysym_to_char(other) else {
+                    let Some(ch) = other.key_char() else {
                         // password will be invalid anyway if it's not a valid char
                         // clearing it will fail auth correctly
                         self.clear();
@@ -280,17 +251,32 @@ impl InputHandler {
 struct Keyb(xkb::State);
 
 impl Keyb {
-    fn new() -> Option<Self> {
-        let context = xkb::Context::new(0);
-        xkb::Keymap::new_from_names(&context, "", "", "", "", None, 0)
-            .map(|kmap| Keyb(xkb::State::new(&kmap)))
+    fn new(conn: &xcb::Connection) -> Self {
+        let has_xkb = x11::setup_xkb_extension(
+            conn,
+            xkb::x11::MIN_MAJOR_XKB_VERSION,
+            xkb::x11::MIN_MINOR_XKB_VERSION,
+            xkb::x11::SetupXkbExtensionFlags::NoFlags,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+        );
+        if !has_xkb {
+            panic!("XKB extension is not supported");
+        }
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let device_id = x11::get_core_keyboard_device_id(conn);
+        let keymap =
+            x11::keymap_new_from_device(&context, conn, device_id, xkb::KEYMAP_COMPILE_NO_FLAGS);
+        Self(x11::state_new_from_device(&keymap, conn, device_id))
+    }
+
+    fn update(&mut self, code: u8, dir: KeyDirection) -> u32 {
+        self.0.update_key(xkb::Keycode::from(code), dir)
     }
 
     fn keycode_to_keysym(&self, code: x::Keycode) -> xkb::Keysym {
         self.0.key_get_one_sym(xkb::Keycode::new(code as u32))
-    }
-
-    fn keysym_to_char(key: xkb::Keysym) -> Option<char> {
-        char::from_u32(key.raw())
     }
 }
