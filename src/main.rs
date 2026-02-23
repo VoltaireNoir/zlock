@@ -1,6 +1,6 @@
-use std::error::Error;
+use std::{error::Error, time::Duration};
 use xcb::{
-    x::{self, EventMask},
+    x::{self, EventMask, Gcontext, Rectangle},
     Connection,
 };
 use xkbcommon::xkb::{self, x11, KeyDirection};
@@ -26,23 +26,29 @@ struct Lock {
     lock: x::Window,
     conn: Connection,
     scr_no: i32,
+    gc: Gcontext,
+    width: u16,
+    height: u16,
 }
 
 impl Lock {
     #[inline]
     fn new() -> Result<Self, Box<dyn Error>> {
         let (conn, scr_no) = Connection::connect(None)?;
-        let (cursor, lock) = (conn.generate_id(), conn.generate_id());
+        let (cursor, lock, gc) = (conn.generate_id(), conn.generate_id(), conn.generate_id());
         Ok(Self {
             lock,
             cursor,
             conn,
             scr_no,
+            gc,
+            width: 0,
+            height: 0,
         })
     }
 
     #[inline]
-    fn draw_win(&self) -> Result<(), Box<dyn Error>> {
+    fn draw_win(&mut self) -> Result<(), Box<dyn Error>> {
         let screen = self
             .conn
             .get_setup()
@@ -61,17 +67,44 @@ impl Lock {
             class: x::WindowClass::CopyFromParent,
             visual: screen.root_visual(),
             value_list: &[
-                x::Cw::BackPixel(screen.black_pixel()),
                 x::Cw::OverrideRedirect(true),
                 x::Cw::EventMask(
                     x::EventMask::KEY_PRESS
                         | x::EventMask::KEYMAP_STATE
-                        | x::EventMask::KEY_RELEASE,
+                        | x::EventMask::KEY_RELEASE
+                        | x::EventMask::EXPOSURE,
                 ),
             ],
         })?;
+        self.width = screen.width_in_pixels();
+        self.height = screen.height_in_pixels();
+        // Create GC and set foreground color
+        self.conn.send_and_check_request(&x::CreateGc {
+            cid: self.gc,
+            drawable: x::Drawable::Window(self.lock),
+            value_list: &[x::Gc::Foreground(rgb2u32(BLACK))],
+        })?;
+
         self.conn
             .send_and_check_request(&x::MapWindow { window: self.lock })?;
+        self.flush()?;
+
+        // wait until window is drawn
+        while !matches!(
+            self.conn.wait_for_event()?,
+            xcb::Event::X(x::Event::Expose(_))
+        ) {}
+
+        self.conn.send_and_check_request(&x::PolyFillRectangle {
+            drawable: x::Drawable::Window(self.lock),
+            gc: self.gc,
+            rectangles: &[Rectangle {
+                x: 0,
+                y: 0,
+                width: screen.width_in_pixels(),
+                height: screen.height_in_pixels(),
+            }],
+        })?;
         Ok(())
     }
 
@@ -123,6 +156,24 @@ impl Lock {
         });
     }
 
+    fn set_win_color(&self, rgb: RGB) -> Result<(), Box<dyn Error>> {
+        self.conn.send_and_check_request(&x::ChangeGc {
+            gc: self.gc,
+            value_list: &[x::Gc::Foreground(rgb2u32(rgb))],
+        })?;
+        self.conn.send_and_check_request(&x::PolyFillRectangle {
+            drawable: x::Drawable::Window(self.lock),
+            gc: self.gc,
+            rectangles: &[Rectangle {
+                x: 0,
+                y: 0,
+                width: self.width,
+                height: self.height,
+            }],
+        })?;
+        self.flush()
+    }
+
     #[inline]
     fn flush(&self) -> Result<(), Box<dyn Error>> {
         self.conn.flush()?;
@@ -131,7 +182,7 @@ impl Lock {
 
     #[inline]
     fn lock_screen() -> Result<Lock, Box<dyn Error>> {
-        let lock = Lock::new()?;
+        let mut lock = Lock::new()?;
         lock.draw_win()?;
         lock.init_cursor()?;
         lock.grab_cursor();
@@ -145,16 +196,22 @@ impl Lock {
         let user = std::env::var("USER").unwrap();
         let mut handler = InputHandler::new(&self.conn);
         loop {
-            handler.get_input(&self.conn);
+            handler.get_input(self);
             let pass = handler.get_str();
             if !pass.is_empty() {
                 pam_client.conversation_mut().set_credentials(&user, pass);
                 if pam_client.authenticate().is_ok() {
-                    return Ok(());
+                    self.set_win_color(GREEN)?;
+                    std::thread::sleep(Duration::from_millis(500));
+                    break;
+                } else {
+                    self.set_win_color(RED)?;
+                    std::thread::sleep(Duration::from_millis(500));
                 }
                 handler.clear();
             }
         }
+        Ok(())
     }
 }
 
@@ -208,9 +265,10 @@ impl InputHandler {
         &self.buf
     }
 
-    fn get_input(&mut self, conn: &Connection) {
+    fn get_input(&mut self, lock: &Lock) {
+        lock.set_win_color(BLACK).unwrap();
         loop {
-            let event = match conn.wait_for_event() {
+            let event = match lock.conn.wait_for_event() {
                 Ok(xcb::Event::X(x::Event::KeyPress(event))) => {
                     self.keyb.update(event.detail(), KeyDirection::Down);
                     event
@@ -224,9 +282,11 @@ impl InputHandler {
 
             match self.keyb.keycode_to_keysym(event.detail()) {
                 xkb::Keysym::Return => {
+                    lock.set_win_color(WHITE).unwrap();
                     break;
                 }
                 xkb::Keysym::Escape => {
+                    lock.set_win_color(BLACK).unwrap();
                     self.clear();
                 }
                 xkb::Keysym::BackSpace => {
@@ -241,6 +301,9 @@ impl InputHandler {
                         break;
                     };
 
+                    if self.buf.is_empty() {
+                        lock.set_win_color(CYAN).unwrap();
+                    }
                     self.push_char(ch);
                 }
             }
@@ -279,4 +342,21 @@ impl Keyb {
     fn keycode_to_keysym(&self, code: x::Keycode) -> xkb::Keysym {
         self.0.key_get_one_sym(xkb::Keycode::new(code as u32))
     }
+}
+
+type RGB = (u8, u8, u8);
+
+const CYAN: RGB = (0, 255, 255);
+
+const RED: RGB = (255, 0, 0);
+
+const GREEN: RGB = (0, 255, 160);
+
+const BLACK: RGB = (0, 0, 0);
+
+const WHITE: RGB = (255, 255, 255);
+
+#[inline]
+fn rgb2u32((r, g, b): RGB) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
