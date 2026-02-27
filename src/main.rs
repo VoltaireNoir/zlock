@@ -1,4 +1,7 @@
-use std::{error::Error, time::Duration};
+#![deny(clippy::unwrap_used)]
+
+use anyhow::{Context, Result};
+use std::time::Duration;
 use xcb::{
     x::{self, EventMask, Gcontext, Rectangle},
     Connection,
@@ -8,16 +11,10 @@ use xkbcommon::xkb::{self, x11, KeyDirection, State};
 const MAX_BUF_SIZE: usize = 100;
 const MIN_BUF_CAP: usize = 15;
 
-// TODO: Add proper error handling
 // TODO: Add simple tty lock as well
 
-fn main() {
-    println!("Locking screen");
-    Lock::lock_screen()
-        .expect("failed to lock the screen")
-        .authenticate()
-        .expect("failure occured while trying to authenticate password");
-    println!("Unlocking screen");
+fn main() -> Result<()> {
+    Lock::lock_screen()?.authenticate()
 }
 
 // TODO: Handle multiple screens
@@ -33,7 +30,7 @@ struct Lock {
 
 impl Lock {
     #[inline]
-    fn new() -> Result<Self, Box<dyn Error>> {
+    fn new() -> Result<Self> {
         let (conn, scr_no) = Connection::connect(None)?;
         let (cursor, lock, gc) = (conn.generate_id(), conn.generate_id(), conn.generate_id());
         Ok(Self {
@@ -48,14 +45,14 @@ impl Lock {
     }
 
     #[inline]
-    fn draw_win(&mut self) -> Result<(), Box<dyn Error>> {
+    fn draw_win(&mut self) -> Result<()> {
         let screen = self
             .conn
             .get_setup()
             .roots()
             .nth(self.scr_no as usize)
-            .expect("unexpected failure while getting screen");
-        self.conn.send_and_check_request(&x::CreateWindow {
+            .context("failed to get active screen")?;
+        self.conn.send_request(&x::CreateWindow {
             depth: screen.root_depth(),
             wid: self.lock,
             parent: screen.root(),
@@ -73,19 +70,18 @@ impl Lock {
                 ),
                 x::Cw::Cursor(x::CURSOR_NONE),
             ],
-        })?;
+        });
         self.width = screen.width_in_pixels();
         self.height = screen.height_in_pixels();
         // Create GC and set foreground color
-        self.conn.send_and_check_request(&x::CreateGc {
+        self.conn.send_request(&x::CreateGc {
             cid: self.gc,
             drawable: x::Drawable::Window(self.lock),
             value_list: &[x::Gc::Foreground(color::BLACK)],
-        })?;
+        });
 
-        self.conn
-            .send_and_check_request(&x::MapWindow { window: self.lock })?;
-        self.flush()?;
+        self.conn.send_request(&x::MapWindow { window: self.lock });
+        self.flush().context("failed to create window")?;
 
         // wait until window is drawn
         while !matches!(
@@ -93,21 +89,23 @@ impl Lock {
             xcb::Event::X(x::Event::Expose(_))
         ) {}
 
-        self.conn.send_and_check_request(&x::PolyFillRectangle {
-            drawable: x::Drawable::Window(self.lock),
-            gc: self.gc,
-            rectangles: &[Rectangle {
-                x: 0,
-                y: 0,
-                width: screen.width_in_pixels(),
-                height: screen.height_in_pixels(),
-            }],
-        })?;
+        self.conn
+            .send_and_check_request(&x::PolyFillRectangle {
+                drawable: x::Drawable::Window(self.lock),
+                gc: self.gc,
+                rectangles: &[Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: screen.width_in_pixels(),
+                    height: screen.height_in_pixels(),
+                }],
+            })
+            .context("failed to set lockscreen color")?;
         Ok(())
     }
 
     #[inline]
-    fn init_cursor(&self) -> Result<(), Box<dyn Error>> {
+    fn init_cursor(&self) {
         let pixmap_id = self.conn.generate_id();
         self.conn.send_request(&x::CreatePixmap {
             depth: 1,
@@ -116,7 +114,7 @@ impl Lock {
             width: 1,
             height: 1,
         });
-        self.conn.send_and_check_request(&x::CreateCursor {
+        self.conn.send_request(&x::CreateCursor {
             cid: self.cursor,
             source: pixmap_id,
             mask: pixmap_id,
@@ -128,12 +126,11 @@ impl Lock {
             back_blue: 0,
             x: 0,
             y: 0,
-        })?;
+        });
         self.conn.send_request(&x::ChangeWindowAttributes {
             window: self.lock,
             value_list: &[x::Cw::Cursor(self.cursor)],
         });
-        Ok(())
     }
 
     #[inline]
@@ -161,48 +158,53 @@ impl Lock {
         });
     }
 
-    fn set_win_color(&self, color: u32) -> Result<(), Box<dyn Error>> {
+    fn set_win_color(&self, color: u32) -> Result<()> {
         self.conn.send_and_check_request(&x::ChangeGc {
             gc: self.gc,
             value_list: &[x::Gc::Foreground(color)],
         })?;
-        self.conn.send_and_check_request(&x::PolyFillRectangle {
-            drawable: x::Drawable::Window(self.lock),
-            gc: self.gc,
-            rectangles: &[Rectangle {
-                x: 0,
-                y: 0,
-                width: self.width,
-                height: self.height,
-            }],
-        })?;
-        self.flush()
+        self.conn
+            .send_and_check_request(&x::PolyFillRectangle {
+                drawable: x::Drawable::Window(self.lock),
+                gc: self.gc,
+                rectangles: &[Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: self.width,
+                    height: self.height,
+                }],
+            })
+            .context("failed to set window color")?;
+        Ok(())
     }
 
     #[inline]
-    fn flush(&self) -> Result<(), Box<dyn Error>> {
+    fn flush(&self) -> Result<()> {
         self.conn.flush()?;
         Ok(())
     }
 
     #[inline]
-    fn lock_screen() -> Result<Lock, Box<dyn Error>> {
+    fn lock_screen() -> Result<Lock> {
         let mut lock = Lock::new()?;
         lock.draw_win()?;
-        lock.init_cursor()?;
+        lock.init_cursor();
         lock.grab_cursor();
         lock.grab_keyboard();
-        lock.flush()?;
+        lock.flush().context("failed to initialize lockscreen")?;
         Ok(lock)
     }
 
-    fn authenticate(&self) -> Result<(), Box<dyn Error>> {
-        let mut pam_client = pam::Client::with_password("system-auth")?;
-        let user = std::env::var("USER").unwrap();
-        let mut handler = InputHandler::new(&self.conn);
+    fn authenticate(&self) -> Result<()> {
+        let mut pam_client =
+            pam::Client::with_password("system-auth").context("failed to initialize PAM client")?;
+        let user = std::env::var("USER").context("could not find user")?;
+        let mut handler =
+            InputHandler::new(&self.conn).context("failed to initialize input handler")?;
         loop {
-            handler.get_input(self);
-            let pass = handler.get_str();
+            let pass = handler
+                .get_input(self)
+                .context("failed to get user input")?;
             if !pass.is_empty() {
                 pam_client.conversation_mut().set_credentials(&user, pass);
                 if pam_client.authenticate().is_ok() {
@@ -241,11 +243,11 @@ struct InputHandler {
 }
 
 impl InputHandler {
-    fn new(conn: &Connection) -> Self {
-        Self {
+    fn new(conn: &Connection) -> Result<Self> {
+        Ok(Self {
             buf: String::with_capacity(MIN_BUF_CAP),
-            keyb: Keyb::new(conn),
-        }
+            keyb: Keyb::new(conn).context("failed to initialize keyboard state")?,
+        })
     }
 
     fn clear(&mut self) {
@@ -264,12 +266,8 @@ impl InputHandler {
         self.buf.pop();
     }
 
-    fn get_str(&self) -> &str {
-        &self.buf
-    }
-
-    fn get_input(&mut self, lock: &Lock) {
-        lock.set_win_color(color::BLACK).unwrap();
+    fn get_input(&mut self, lock: &Lock) -> Result<&str> {
+        lock.set_win_color(color::BLACK)?;
         loop {
             let event = match lock.conn.wait_for_event() {
                 Ok(xcb::Event::X(x::Event::KeyPress(event))) => {
@@ -288,7 +286,7 @@ impl InputHandler {
                     break;
                 }
                 xkb::Keysym::Escape => {
-                    lock.set_win_color(color::BLACK).unwrap();
+                    lock.set_win_color(color::BLACK)?;
                     self.clear();
                 }
                 xkb::Keysym::BackSpace => {
@@ -304,19 +302,20 @@ impl InputHandler {
                     };
 
                     if self.buf.is_empty() {
-                        lock.set_win_color(color::CYAN).unwrap();
+                        lock.set_win_color(color::CYAN)?;
                     }
                     self.push_char(ch);
                 }
             }
         }
+        Ok(&self.buf)
     }
 }
 
 struct Keyb(xkb::State);
 
 impl Keyb {
-    fn new(conn: &xcb::Connection) -> Self {
+    fn new(conn: &xcb::Connection) -> Result<Self> {
         let has_xkb = x11::setup_xkb_extension(
             conn,
             xkb::x11::MIN_MAJOR_XKB_VERSION,
@@ -328,20 +327,21 @@ impl Keyb {
             &mut 0,
         );
         if !has_xkb {
-            panic!("XKB extension is not supported");
+            anyhow::bail!("cannot take user input: XKB extension is not supported");
         }
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let device_id = x11::get_core_keyboard_device_id(conn);
-        let keymap =
-            x11::keymap_new_from_device(&context, conn, device_id, xkb::KEYMAP_COMPILE_NO_FLAGS);
+        let state = x11::state_new_from_device(
+            &x11::keymap_new_from_device(&context, conn, device_id, xkb::KEYMAP_COMPILE_NO_FLAGS),
+            conn,
+            device_id,
+        );
 
-        Self(Self::clear_mod_state(x11::state_new_from_device(
-            &keymap, conn, device_id,
-        )))
+        Ok(Self(Self::clear_mod_state(state)))
     }
 
-    fn update(&mut self, code: u8, dir: KeyDirection) -> u32 {
-        self.0.update_key(xkb::Keycode::from(code), dir)
+    fn update(&mut self, code: u8, dir: KeyDirection) {
+        self.0.update_key(xkb::Keycode::from(code), dir);
     }
 
     fn keycode_to_keysym(&self, code: x::Keycode) -> xkb::Keysym {
