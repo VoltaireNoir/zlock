@@ -80,7 +80,7 @@ impl Lock {
         self.conn.send_and_check_request(&x::CreateGc {
             cid: self.gc,
             drawable: x::Drawable::Window(self.lock),
-            value_list: &[x::Gc::Foreground(rgb2u32(BLACK))],
+            value_list: &[x::Gc::Foreground(color::BLACK)],
         })?;
 
         self.conn
@@ -161,10 +161,10 @@ impl Lock {
         });
     }
 
-    fn set_win_color(&self, rgb: RGB) -> Result<(), Box<dyn Error>> {
+    fn set_win_color(&self, color: u32) -> Result<(), Box<dyn Error>> {
         self.conn.send_and_check_request(&x::ChangeGc {
             gc: self.gc,
-            value_list: &[x::Gc::Foreground(rgb2u32(rgb))],
+            value_list: &[x::Gc::Foreground(color)],
         })?;
         self.conn.send_and_check_request(&x::PolyFillRectangle {
             drawable: x::Drawable::Window(self.lock),
@@ -206,11 +206,9 @@ impl Lock {
             if !pass.is_empty() {
                 pam_client.conversation_mut().set_credentials(&user, pass);
                 if pam_client.authenticate().is_ok() {
-                    self.set_win_color(GREEN)?;
-                    std::thread::sleep(Duration::from_millis(500));
                     break;
                 } else {
-                    self.set_win_color(RED)?;
+                    self.set_win_color(color::RED)?;
                     std::thread::sleep(Duration::from_millis(500));
                 }
                 handler.clear();
@@ -271,7 +269,7 @@ impl InputHandler {
     }
 
     fn get_input(&mut self, lock: &Lock) {
-        lock.set_win_color(BLACK).unwrap();
+        lock.set_win_color(color::BLACK).unwrap();
         loop {
             let event = match lock.conn.wait_for_event() {
                 Ok(xcb::Event::X(x::Event::KeyPress(event))) => {
@@ -287,11 +285,10 @@ impl InputHandler {
 
             match self.keyb.keycode_to_keysym(event.detail()) {
                 xkb::Keysym::Return => {
-                    lock.set_win_color(WHITE).unwrap();
                     break;
                 }
                 xkb::Keysym::Escape => {
-                    lock.set_win_color(BLACK).unwrap();
+                    lock.set_win_color(color::BLACK).unwrap();
                     self.clear();
                 }
                 xkb::Keysym::BackSpace => {
@@ -307,7 +304,7 @@ impl InputHandler {
                     };
 
                     if self.buf.is_empty() {
-                        lock.set_win_color(CYAN).unwrap();
+                        lock.set_win_color(color::CYAN).unwrap();
                     }
                     self.push_char(ch);
                 }
@@ -371,19 +368,15 @@ impl Keyb {
     }
 }
 
-type RGB = (u8, u8, u8);
+mod color {
+    pub const CYAN: u32 = rgb(0, 255, 255);
 
-const CYAN: RGB = (0, 255, 255);
+    pub const RED: u32 = rgb(255, 0, 0);
 
-const RED: RGB = (255, 0, 0);
+    pub const BLACK: u32 = rgb(0, 0, 0);
 
-const GREEN: RGB = (0, 255, 160);
-
-const BLACK: RGB = (0, 0, 0);
-
-const WHITE: RGB = (255, 255, 255);
-
-#[inline]
-fn rgb2u32((r, g, b): RGB) -> u32 {
-    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+    #[inline]
+    const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+        ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+    }
 }
