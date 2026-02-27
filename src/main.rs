@@ -71,6 +71,7 @@ impl Lock {
                 x::Cw::EventMask(
                     x::EventMask::KEY_PRESS | x::EventMask::KEY_RELEASE | x::EventMask::EXPOSURE,
                 ),
+                x::Cw::Cursor(x::CURSOR_NONE),
             ],
         })?;
         self.width = screen.width_in_pixels();
@@ -107,31 +108,38 @@ impl Lock {
 
     #[inline]
     fn init_cursor(&self) -> Result<(), Box<dyn Error>> {
-        let font: x::Font = self.conn.generate_id();
-        self.conn.send_and_check_request(&x::OpenFont {
-            fid: font,
-            name: "cursor".as_bytes(),
-        })?;
-        self.conn.send_and_check_request(&x::CreateGlyphCursor {
+        let pixmap_id = self.conn.generate_id();
+        self.conn.send_request(&x::CreatePixmap {
+            depth: 1,
+            pid: pixmap_id,
+            drawable: x::Drawable::Window(self.lock),
+            width: 1,
+            height: 1,
+        });
+        self.conn.send_and_check_request(&x::CreateCursor {
             cid: self.cursor,
-            source_font: font,
-            mask_font: font,
-            source_char: ' ' as u16,
-            mask_char: ' ' as u16,
+            source: pixmap_id,
+            mask: pixmap_id,
             fore_red: 0,
             fore_green: 0,
             fore_blue: 0,
             back_red: 0,
             back_green: 0,
             back_blue: 0,
+            x: 0,
+            y: 0,
         })?;
+        self.conn.send_request(&x::ChangeWindowAttributes {
+            window: self.lock,
+            value_list: &[x::Cw::Cursor(self.cursor)],
+        });
         Ok(())
     }
 
     #[inline]
     fn grab_cursor(&self) {
         self.conn.send_request(&x::GrabPointer {
-            owner_events: false,
+            owner_events: true,
             grab_window: self.lock,
             event_mask: EventMask::empty(),
             pointer_mode: x::GrabMode::Async,
