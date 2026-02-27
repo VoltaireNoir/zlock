@@ -11,8 +11,6 @@ use xkbcommon::xkb::{self, x11, KeyDirection, State};
 const MAX_BUF_SIZE: usize = 100;
 const MIN_BUF_CAP: usize = 15;
 
-// TODO: Add simple tty lock as well
-
 fn main() -> Result<()> {
     Lock::lock_screen()?.authenticate()
 }
