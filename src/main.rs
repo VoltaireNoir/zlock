@@ -3,7 +3,7 @@ use xcb::{
     x::{self, EventMask, Gcontext, Rectangle},
     Connection,
 };
-use xkbcommon::xkb::{self, x11, KeyDirection};
+use xkbcommon::xkb::{self, x11, KeyDirection, State};
 
 const MAX_BUF_SIZE: usize = 15;
 const MIN_BUF_CAP: usize = 15;
@@ -69,10 +69,7 @@ impl Lock {
             value_list: &[
                 x::Cw::OverrideRedirect(true),
                 x::Cw::EventMask(
-                    x::EventMask::KEY_PRESS
-                        | x::EventMask::KEYMAP_STATE
-                        | x::EventMask::KEY_RELEASE
-                        | x::EventMask::EXPOSURE,
+                    x::EventMask::KEY_PRESS | x::EventMask::KEY_RELEASE | x::EventMask::EXPOSURE,
                 ),
             ],
         })?;
@@ -332,7 +329,10 @@ impl Keyb {
         let device_id = x11::get_core_keyboard_device_id(conn);
         let keymap =
             x11::keymap_new_from_device(&context, conn, device_id, xkb::KEYMAP_COMPILE_NO_FLAGS);
-        Self(x11::state_new_from_device(&keymap, conn, device_id))
+
+        Self(Self::clear_mod_state(x11::state_new_from_device(
+            &keymap, conn, device_id,
+        )))
     }
 
     fn update(&mut self, code: u8, dir: KeyDirection) -> u32 {
@@ -341,6 +341,25 @@ impl Keyb {
 
     fn keycode_to_keysym(&self, code: x::Keycode) -> xkb::Keysym {
         self.0.key_get_one_sym(xkb::Keycode::new(code as u32))
+    }
+
+    /// Clear active depressed or latched modifier state while preserving locked modifiers
+    fn clear_mod_state(mut state: State) -> State {
+        // Get the current locked modifiers (like CapsLock/NumLock)
+        let locked_mods = state.serialize_mods(xkb::STATE_MODS_LOCKED);
+        let locked_layout = state.serialize_layout(xkb::STATE_LAYOUT_LOCKED);
+
+        // Apply the reset:
+        // Clear Depressed and Latched, but keep Locked.
+        state.update_mask(
+            0,             // depressed (physically held keys - clears your Mod+Shift)
+            0,             // latched (sticky keys)
+            locked_mods,   // locked (keeps CapsLock/NumLock)
+            0,             // depressed layout
+            0,             // latched layout
+            locked_layout, // locked layout
+        );
+        state
     }
 }
 
