@@ -5,7 +5,7 @@ use xcb::{
 };
 use xkbcommon::xkb::{self, x11, KeyDirection, State};
 
-const MAX_BUF_SIZE: usize = 15;
+const MAX_BUF_SIZE: usize = 100;
 const MIN_BUF_CAP: usize = 15;
 
 // TODO: Add proper error handling
