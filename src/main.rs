@@ -267,7 +267,6 @@ impl InputHandler {
     }
 
     fn get_input(&mut self, lock: &Lock) -> Result<&str> {
-        lock.set_win_color(color::BLACK)?;
         loop {
             let event = match lock.conn.wait_for_event() {
                 Ok(xcb::Event::X(x::Event::KeyPress(event))) => {
